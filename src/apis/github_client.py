@@ -1,0 +1,80 @@
+"""GitHub API client for reading krkn repos and creating PRs/issues."""
+
+import logging
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+GITHUB_API = "https://api.github.com"
+
+
+class GitHubClient:
+    """Read krkn-chaos repos and create PRs/issues."""
+
+    def __init__(self, token: str):
+        self._session = requests.Session()
+        self._session.headers.update(
+            {
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github.v3+json",
+            }
+        )
+
+    def list_scenario_files(self, owner: str, repo: str, path: str = "scenarios") -> list[dict]:
+        """List scenario YAML files in a krkn repo."""
+        url = f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}"
+        try:
+            response = self._session.get(url, timeout=30)
+            response.raise_for_status()
+        except requests.RequestException as e:
+            logger.error("GitHub list failed for %s/%s/%s: %s", owner, repo, path, e)
+            return []
+
+        items = response.json()
+        if not isinstance(items, list):
+            return []
+
+        results = []
+        for item in items:
+            if item["type"] == "dir":
+                results.extend(
+                    self.list_scenario_files(owner, repo, item["path"])
+                )
+            elif item["name"].endswith((".yaml", ".yml")):
+                results.append(
+                    {"name": item["name"], "path": item["path"], "url": item["html_url"]}
+                )
+        return results
+
+    def get_file_content(self, owner: str, repo: str, path: str) -> str | None:
+        """Get the content of a file from a GitHub repo."""
+        url = f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}"
+        try:
+            response = self._session.get(
+                url, headers={"Accept": "application/vnd.github.v3.raw"}, timeout=30
+            )
+            response.raise_for_status()
+            return response.text
+        except requests.RequestException as e:
+            logger.error("GitHub get file failed for %s/%s/%s: %s", owner, repo, path, e)
+            return None
+
+    def create_issue(
+        self, owner: str, repo: str, title: str, body: str, labels: list[str] | None = None
+    ) -> dict | None:
+        """Create a GitHub issue."""
+        url = f"{GITHUB_API}/repos/{owner}/{repo}/issues"
+        payload = {"title": title, "body": body}
+        if labels:
+            payload["labels"] = labels
+
+        try:
+            response = self._session.post(url, json=payload, timeout=30)
+            response.raise_for_status()
+            result = response.json()
+            logger.info("Created issue: %s", result.get("html_url"))
+            return result
+        except requests.RequestException as e:
+            logger.error("GitHub create issue failed: %s", e)
+            return None

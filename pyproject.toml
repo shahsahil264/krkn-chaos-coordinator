@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "krkn-chaos-coordinator"
+version = "0.1.0"
+description = "AI-driven multi-agent system for autonomous chaos test coverage expansion"
+requires-python = ">=3.11"
+dependencies = [
+    "graphiti-core>=0.28",
+    "chromadb>=1.5",
+    "ollama>=0.6",
+    "pydantic>=2.10",
+    "requests>=2.31",
+    "pyyaml>=6.0",
+    "neo4j>=5.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=4.0",
+    "ruff>=0.4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100

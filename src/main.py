@@ -1,0 +1,86 @@
+"""Main entry point for krkn-chaos-coordinator."""
+
+import argparse
+import logging
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+from src.apis.jira_client import JiraClient, JiraConfig
+from src.apis.sippy_client import SippyClient
+from src.apis.github_client import GitHubClient
+from src.agents.control_plane_agent import ControlPlaneAgent
+from src.coordinator.orchestrator import deduplicate_gaps, format_approval_queue, format_summary
+from src.knowledge.chromadb_store import ChromaStore
+from src.knowledge.scenario_index import index_scenarios_from_repo
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="krkn-chaos-coordinator")
+    parser.add_argument("--release", default="4.21", help="OCP release to analyze")
+    parser.add_argument("--agent", default=None, help="Run a single agent (e.g., control_plane)")
+    parser.add_argument(
+        "--krkn-repo", default=str(Path.home() / "krkn"), help="Path to local krkn repo"
+    )
+    args = parser.parse_args()
+
+    load_dotenv()
+
+    # Initialize API clients
+    jira = JiraClient(
+        JiraConfig(
+            url=os.environ.get("JIRA_URL", "https://redhat.atlassian.net"),
+            username=os.environ.get("JIRA_USERNAME", ""),
+            api_token=os.environ.get("JIRA_API_TOKEN", ""),
+        )
+    )
+    sippy = SippyClient()
+    github = GitHubClient(token=os.environ.get("GITHUB_TOKEN", ""))
+
+    # Initialize knowledge layer
+    chroma = ChromaStore(persist_dir="./chroma_data")
+    scenarios = index_scenarios_from_repo(Path(args.krkn_repo))
+
+    logger.info("Indexed %d scenarios from %s", len(scenarios), args.krkn_repo)
+    logger.info("Target release: %s", args.release)
+
+    # Build agents
+    agent_kwargs = {
+        "jira": jira,
+        "sippy": sippy,
+        "github": github,
+        "chroma": chroma,
+        "scenarios": scenarios,
+        "release": args.release,
+    }
+
+    agents_to_run = []
+    if args.agent == "control_plane" or args.agent is None:
+        agents_to_run.append(ControlPlaneAgent(**agent_kwargs))
+
+    # Run agents
+    results = []
+    for agent in agents_to_run:
+        result = agent.run()
+        results.append(result)
+
+    # Orchestrator: deduplicate and format
+    gaps = deduplicate_gaps(results)
+
+    print(format_summary(results))
+    print()
+    if gaps:
+        print(format_approval_queue(gaps))
+    else:
+        print("No chaos test coverage gaps identified.")
+
+
+if __name__ == "__main__":
+    main()
