@@ -63,7 +63,7 @@ class GitHubClient:
     def create_issue(
         self, owner: str, repo: str, title: str, body: str, labels: list[str] | None = None
     ) -> dict | None:
-        """Create a GitHub issue."""
+        """Create a GitHub issue. Retries without labels if label validation fails."""
         url = f"{GITHUB_API}/repos/{owner}/{repo}/issues"
         payload = {"title": title, "body": body}
         if labels:
@@ -71,10 +71,18 @@ class GitHubClient:
 
         try:
             response = self._session.post(url, json=payload, timeout=30)
+            # If labels caused a 422 (label doesn't exist), retry without them
+            if response.status_code == 422 and labels:
+                logger.warning("Label validation failed, retrying without labels")
+                payload.pop("labels", None)
+                response = self._session.post(url, json=payload, timeout=30)
             response.raise_for_status()
             result = response.json()
             logger.info("Created issue: %s", result.get("html_url"))
             return result
         except requests.RequestException as e:
-            logger.error("GitHub create issue failed: %s", e)
+            error_body = ""
+            if hasattr(e, "response") and e.response is not None:
+                error_body = e.response.text[:500]
+            logger.error("GitHub create issue failed: %s | %s", e, error_body)
             return None

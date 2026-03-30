@@ -661,24 +661,28 @@ if run_button or st.session_state.get("has_run"):
                                 token = gh_env.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
 
                         if not token:
-                            st.error("GitHub token not found. Set GITHUB_PERSONAL_ACCESS_TOKEN env var.")
+                            st.error("GitHub token not found. Set GITHUB_PERSONAL_ACCESS_TOKEN env var or configure in ~/.cursor/mcp.json")
                         else:
                             github = GitHubClient(token=token)
                             title = build_issue_title(gap)
                             body = build_issue_body(gap, "control_plane")
-                            result = github.create_issue(
-                                owner=TARGET_OWNER,
-                                repo=TARGET_REPO,
-                                title=title,
-                                body=body,
-                                labels=["chaos-coordinator"],
-                            )
+
+                            with st.spinner(f"Creating issue on {TARGET_OWNER}/{TARGET_REPO}..."):
+                                result = github.create_issue(
+                                    owner=TARGET_OWNER,
+                                    repo=TARGET_REPO,
+                                    title=title,
+                                    body=body,
+                                    labels=["chaos-coordinator"],
+                                )
+
                             if result:
                                 st.session_state["gap_actions"][gap_key] = "approved"
                                 st.session_state[f"issue_url_{gap_key}"] = result.get("html_url", "")
+                                st.toast(f"Issue created for {gap.bug.key}", icon="✅")
                                 st.rerun()
                             else:
-                                st.error(f"Failed to create issue for {gap.bug.key}")
+                                st.error(f"Failed to create issue for {gap.bug.key}. Check terminal logs for details.")
 
                     if col_b.button("REJECT", key=f"reject_{i}"):
                         st.session_state["gap_actions"][gap_key] = "rejected"
