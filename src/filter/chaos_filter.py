@@ -162,20 +162,56 @@ def _extract_failure_mode(text: str, matched_keywords: list[str]) -> str:
 
 
 def _match_injection_method(text: str) -> str | None:
-    """Match bug description against krkn's injection capabilities."""
-    injection_map = {
-        "pod": ["pod", "container", "restart", "crashloop", "eviction", "oom"],
-        "node": ["node", "drain", "reboot", "shutdown", "kubelet", "not ready"],
-        "network": ["network", "partition", "latency", "dns", "connection", "timeout"],
-        "resource_stress": ["cpu", "memory", "disk", "pressure", "throttl", "resource"],
-        "time_skew": ["clock", "ntp", "time skew", "certificate expired"],
-        "cloud_provider": ["instance", "volume", "detach", "az ", "availability zone"],
-        "cluster_state": ["crd", "configmap", "scale", "operator", "upgrade", "rollback"],
-    }
+    """Match bug description against krkn's injection capabilities.
 
-    for capability, keywords in injection_map.items():
+    Priority order matters — more specific matches first to avoid
+    'node delete' matching 'pod' because 'delete' isn't in pod keywords.
+    """
+    # Ordered from most specific to least specific
+    injection_rules: list[tuple[str, list[str]]] = [
+        ("node", [
+            "node delete", "node replace", "node drain", "node reboot",
+            "node shutdown", "node fail", "node not ready", "kubelet",
+            "machine api", "node outage", "nodestatuses",
+        ]),
+        ("network", [
+            "network partition", "network chaos", "latency", "packet loss",
+            "dns fail", "connection refused", "ingress", "ovn",
+            "network outage", "network disruption",
+        ]),
+        ("resource_stress", [
+            "cpu", "memory pressure", "disk full", "disk pressure",
+            "throttl", "resource pressure", "api server load",
+            "resource stress", "hog", "i/o pressure",
+        ]),
+        ("pod", [
+            "pod kill", "pod delete", "pod disruption", "pod eviction",
+            "container restart", "crashloop", "oom", "out of memory",
+            "static pod", "pod fail", "pod outage",
+        ]),
+        ("cluster_state", [
+            "crd", "configmap", "operator", "upgrade fail", "rollback",
+            "scale", "quorum", "leader election", "member", "etcd",
+            "split brain", "cluster state", "corrupt",
+        ]),
+        ("time_skew", [
+            "clock", "ntp", "time skew", "certificate expired",
+        ]),
+        ("cloud_provider", [
+            "instance", "volume detach", "stop vm", "az outage",
+            "availability zone",
+        ]),
+    ]
+
+    for capability, keywords in injection_rules:
         for kw in keywords:
             if kw in text:
                 return capability
+
+    # Fallback: generic failure keywords
+    generic_failure = ["fail", "crash", "unavailable", "degraded", "unhealthy", "disruption", "outage"]
+    for kw in generic_failure:
+        if kw in text:
+            return "cluster_state"
 
     return None
