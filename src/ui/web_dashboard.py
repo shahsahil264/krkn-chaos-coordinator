@@ -5,6 +5,7 @@ Dark industrial theme with amber/red danger accents.
 """
 
 import json
+import os
 import sys
 import datetime
 from collections import Counter
@@ -21,10 +22,14 @@ from src.knowledge.scenario_index import index_scenarios_from_repo
 from src.knowledge.component_map import AGENT_COMPONENTS, get_all_agents
 from src.coordinator.orchestrator import deduplicate_gaps
 from src.agents.act import build_issue_title, build_issue_body
+from src.apis.github_client import GitHubClient
 from src.models import (
     ActionType, Bug, Confidence, FilterResult,
     GapAnalysis, MatchResult, ScenarioMatch,
 )
+
+TARGET_OWNER = "shahsahil264"
+TARGET_REPO = "krkn"
 
 HISTORY_FILE = Path("/tmp/krkn_coordinator_history.json")
 
@@ -603,11 +608,81 @@ if run_button or st.session_state.get("has_run"):
             </div>
             """, unsafe_allow_html=True)
         else:
+            # Init action state
+            if "gap_actions" not in st.session_state:
+                st.session_state["gap_actions"] = {}
+
             for i, gap in enumerate(gaps):
-                st.markdown(render_gap_card(gap, i), unsafe_allow_html=True)
-                col_a, col_b, col_c = st.columns([1, 1, 6])
-                col_a.button("APPROVE", key=f"approve_{i}", type="primary")
-                col_b.button("REJECT", key=f"reject_{i}")
+                gap_key = f"{gap.bug.key}"
+                action_state = st.session_state["gap_actions"].get(gap_key)
+
+                if action_state == "approved":
+                    issue_url = st.session_state.get(f"issue_url_{gap_key}", "")
+                    st.markdown(f"""
+                    <div class="gap-card high" style="border-left-color: var(--accent-green); opacity: 0.7;">
+                        <div class="gap-header">
+                            <span class="gap-bug-key">{gap.bug.key}</span>
+                            <span style="font-family: JetBrains Mono; font-size: 0.75rem; color: var(--accent-green);">
+                                APPROVED — Issue Created
+                            </span>
+                        </div>
+                        <div class="gap-summary">{gap.bug.summary[:90]}</div>
+                        <div class="gap-meta">
+                            <a href="{issue_url}" target="_blank" style="color: var(--accent-cyan);">{issue_url}</a>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                elif action_state == "rejected":
+                    st.markdown(f"""
+                    <div class="gap-card low" style="opacity: 0.4;">
+                        <div class="gap-header">
+                            <span class="gap-bug-key" style="text-decoration: line-through;">{gap.bug.key}</span>
+                            <span style="font-family: JetBrains Mono; font-size: 0.75rem; color: var(--text-dim);">
+                                REJECTED
+                            </span>
+                        </div>
+                        <div class="gap-summary" style="text-decoration: line-through;">{gap.bug.summary[:90]}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.markdown(render_gap_card(gap, i), unsafe_allow_html=True)
+                    col_a, col_b, col_c = st.columns([1, 1, 6])
+
+                    if col_a.button("APPROVE", key=f"approve_{i}", type="primary"):
+                        # Get GitHub token
+                        token = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+                        if not token:
+                            # Try reading from cursor config
+                            cursor_cfg = Path.home() / ".cursor" / "mcp.json"
+                            if cursor_cfg.exists():
+                                with open(cursor_cfg) as f:
+                                    cfg = json.load(f)
+                                gh_env = cfg.get("mcpServers", {}).get("github", {}).get("env", {})
+                                token = gh_env.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+
+                        if not token:
+                            st.error("GitHub token not found. Set GITHUB_PERSONAL_ACCESS_TOKEN env var.")
+                        else:
+                            github = GitHubClient(token=token)
+                            title = build_issue_title(gap)
+                            body = build_issue_body(gap, "control_plane")
+                            result = github.create_issue(
+                                owner=TARGET_OWNER,
+                                repo=TARGET_REPO,
+                                title=title,
+                                body=body,
+                                labels=["chaos-coordinator"],
+                            )
+                            if result:
+                                st.session_state["gap_actions"][gap_key] = "approved"
+                                st.session_state[f"issue_url_{gap_key}"] = result.get("html_url", "")
+                                st.rerun()
+                            else:
+                                st.error(f"Failed to create issue for {gap.bug.key}")
+
+                    if col_b.button("REJECT", key=f"reject_{i}"):
+                        st.session_state["gap_actions"][gap_key] = "rejected"
+                        st.rerun()
 
     # === TAB 2: BUG INTEL ===
     with tab2:
@@ -821,17 +896,6 @@ if run_button or st.session_state.get("has_run"):
 
 else:
     # Landing page
-    st.markdown("""
-    <div style="text-align: center; padding: 40px 0;">
-        <div style="font-family: 'JetBrains Mono'; font-size: 4rem; color: var(--accent-red); line-height: 1; opacity: 0.8;">
-            &#9760;
-        </div>
-        <div style="font-family: 'JetBrains Mono'; font-size: 1rem; color: var(--text-secondary); margin-top: 12px;">
-            Press <span style="color: var(--accent-red); font-weight: 600;">LAUNCH SCAN</span> to begin
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
     st.markdown("#### Agent Architecture")
     st.code("""
     Orchestrator
