@@ -390,8 +390,12 @@ def load_bugs_from_json(path: str) -> list[Bug]:
     return bugs
 
 
-def run_pipeline(bugs, krkn_path):
-    relevant, skipped = filter_bugs(bugs)
+def run_pipeline(bugs, krkn_path, use_llm_filter=False):
+    if use_llm_filter:
+        from src.filter.llm_filter import llm_filter_bugs
+        relevant, skipped = llm_filter_bugs(bugs)
+    else:
+        relevant, skipped = filter_bugs(bugs)
     scenarios = index_scenarios_from_repo(Path(krkn_path))
     chroma = ChromaStore(persist_dir="/tmp/krkn_chroma_streamlit")
     chunks = [
@@ -540,6 +544,8 @@ with st.sidebar:
         default=["control_plane"],
         format_func=lambda x: x.replace("_", " ").title(),
     )
+    use_llm = st.toggle("LLM Filter (Ollama)", value=False,
+                         help="Use llama3 for nuanced chaos relevance decisions. Slower but catches edge cases.")
 
     st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
 
@@ -590,7 +596,7 @@ if run_button or st.session_state.get("has_run"):
 
     with st.status("Executing pipeline...", expanded=True) as status:
         st.write(f"`DISCOVER` Loading {len(bugs)} bugs...")
-        relevant, skipped, matched, unmatched, gaps, scenarios = run_pipeline(bugs, krkn_path)
+        relevant, skipped, matched, unmatched, gaps, scenarios = run_pipeline(bugs, krkn_path, use_llm)
         st.write(f"`FILTER` {len(relevant)} relevant, {len(skipped)} filtered")
         st.write(f"`MAP` {len(scenarios)} scenarios indexed")
         st.write(f"`ANALYZE` {len(gaps)} gaps identified")
