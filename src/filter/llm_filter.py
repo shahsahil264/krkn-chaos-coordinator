@@ -1,10 +1,13 @@
-"""LLM-enhanced chaos relevance filter using Ollama."""
+"""LLM-enhanced chaos relevance filter — pluggable backend.
+
+Supports: Ollama (local), Anthropic (Claude API), OpenAI, Google Gemini.
+Auto-detects the best available backend from environment variables.
+"""
 
 import json
 import logging
 
-import ollama
-
+from src.filter.llm_config import LLMBackendConfig, LLMProvider, detect_llm_backend
 from src.models import Bug, FilterResult
 
 logger = logging.getLogger(__name__)
@@ -46,11 +49,69 @@ Respond with ONLY a JSON object, no other text:
 }"""
 
 
-def llm_filter_bug(bug: Bug, model: str = "llama3") -> FilterResult:
+def _call_llm(messages: list[dict], config: LLMBackendConfig) -> str:
+    """Call the configured LLM backend and return the response text."""
+    if config.provider == LLMProvider.OLLAMA:
+        import ollama
+        response = ollama.chat(
+            model=config.model,
+            messages=messages,
+            options={"temperature": 0.1, "num_predict": 300},
+        )
+        return response["message"]["content"].strip()
+
+    elif config.provider == LLMProvider.ANTHROPIC:
+        import anthropic
+        client = anthropic.Anthropic(api_key=config.api_key)
+        system = messages[0]["content"] if messages[0]["role"] == "system" else ""
+        user_msgs = [m for m in messages if m["role"] != "system"]
+        response = client.messages.create(
+            model=config.model,
+            max_tokens=300,
+            system=system,
+            messages=user_msgs,
+            temperature=0.1,
+        )
+        return response.content[0].text.strip()
+
+    elif config.provider == LLMProvider.OPENAI:
+        import openai
+        client = openai.OpenAI(api_key=config.api_key)
+        response = client.chat.completions.create(
+            model=config.model,
+            messages=messages,
+            max_tokens=300,
+            temperature=0.1,
+        )
+        return response.choices[0].message.content.strip()
+
+    elif config.provider == LLMProvider.GOOGLE:
+        import google.genai as genai
+        client = genai.Client(api_key=config.api_key)
+        system = messages[0]["content"] if messages[0]["role"] == "system" else ""
+        user_msg = messages[-1]["content"]
+        response = client.models.generate_content(
+            model=config.model,
+            contents=f"{system}\n\n{user_msg}",
+        )
+        return response.text.strip()
+
+    raise ValueError(f"Unsupported LLM provider: {config.provider}")
+
+
+def llm_filter_bug(bug: Bug, config: LLMBackendConfig | None = None) -> FilterResult:
     """Use LLM to determine if a bug is chaos-relevant.
 
-    Falls back to the keyword filter result if LLM fails.
+    Auto-detects the best available LLM backend if config not provided.
+    Falls back to the keyword filter if LLM fails.
     """
+    if config is None:
+        config = detect_llm_backend()
+
+    if config.provider == LLMProvider.NONE:
+        from src.filter.chaos_filter import filter_bug
+        return filter_bug(bug)
+
     prompt = f"""Analyze this OpenShift bug for chaos test relevance:
 
 Bug Key: {bug.key}
@@ -62,16 +123,13 @@ Description: {bug.description[:1500] if bug.description else 'No description'}
 Is this bug chaos-relevant? Respond with JSON only."""
 
     try:
-        response = ollama.chat(
-            model=model,
+        text = _call_llm(
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
-            options={"temperature": 0.1, "num_predict": 300},
+            config=config,
         )
-
-        text = response["message"]["content"].strip()
 
         # Extract JSON from response (handle markdown code blocks)
         if "```" in text:
@@ -97,15 +155,23 @@ Is this bug chaos-relevant? Respond with JSON only."""
 
 
 def llm_filter_bugs(
-    bugs: list[Bug], model: str = "llama3"
+    bugs: list[Bug], config: LLMBackendConfig | None = None,
 ) -> tuple[list[FilterResult], list[FilterResult]]:
-    """Filter bugs using LLM with fallback to keyword filter."""
+    """Filter bugs using LLM with fallback to keyword filter.
+
+    Auto-detects the best available LLM backend if config not provided.
+    """
+    if config is None:
+        config = detect_llm_backend()
+
+    logger.info("LLM filter using %s (%s)", config.provider.value, config.model)
+
     relevant = []
     skipped = []
 
     for i, bug in enumerate(bugs):
         logger.info("LLM filtering %d/%d: %s", i + 1, len(bugs), bug.key)
-        result = llm_filter_bug(bug, model)
+        result = llm_filter_bug(bug, config)
         if result.chaos_relevant:
             relevant.append(result)
             logger.info("  PASS: %s (%s)", result.failure_mode, result.injection_method)
