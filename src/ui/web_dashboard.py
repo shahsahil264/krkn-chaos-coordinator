@@ -390,8 +390,8 @@ def load_bugs_from_json(path: str) -> list[Bug]:
     return bugs
 
 
-def run_pipeline(bugs, krkn_path, use_llm_filter=False):
-    if use_llm_filter:
+def run_pipeline(bugs, krkn_path, use_llm=False):
+    if use_llm:
         from src.filter.llm_filter import llm_filter_bugs
         relevant, skipped = llm_filter_bugs(bugs)
     else:
