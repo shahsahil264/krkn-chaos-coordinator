@@ -10,6 +10,30 @@ from src.models import Bug
 logger = logging.getLogger(__name__)
 
 
+def _extract_text_from_adf(doc: dict) -> str:
+    """Extract plain text from Atlassian Document Format (ADF).
+
+    JIRA REST API v3 returns descriptions as ADF (nested JSON) instead of
+    plain strings. This recursively extracts text nodes.
+    """
+    parts: list[str] = []
+
+    def _walk(node: dict | list) -> None:
+        if isinstance(node, list):
+            for item in node:
+                _walk(item)
+            return
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "text":
+            parts.append(node.get("text", ""))
+        for child in node.get("content", []):
+            _walk(child)
+
+    _walk(doc)
+    return " ".join(parts)
+
+
 @dataclass(frozen=True)
 class JiraConfig:
     url: str
@@ -27,15 +51,48 @@ class JiraClient:
         self._session.headers.update({"Accept": "application/json"})
 
     def get_bugs_by_components(
-        self, components: list[str], days: int = 14, max_results: int = 50
+        self,
+        components: list[str],
+        days: int = 14,
+        max_results: int = 50,
+        priority_filter: bool = True,
     ) -> list[Bug]:
-        """Query OCPBUGS for recent bugs in the given components."""
+        """Query OCPBUGS for recent bugs in the given components.
+
+        When priority_filter is True, fetches Critical/Major/Blocker bugs first,
+        then backfills with remaining bugs up to max_results.
+        """
         component_list = ", ".join(f'"{c}"' for c in components)
-        jql = (
+
+        if not priority_filter:
+            jql = (
+                f"project = OCPBUGS AND component IN ({component_list}) "
+                f"AND created >= -{days}d ORDER BY created DESC"
+            )
+            return self._search(jql, max_results)
+
+        # Priority bugs first
+        priority_jql = (
+            f"project = OCPBUGS AND component IN ({component_list}) "
+            f"AND priority IN (Blocker, Critical, Major) "
+            f"AND created >= -{days}d ORDER BY priority ASC, created DESC"
+        )
+        priority_bugs = self._search(priority_jql, max_results)
+
+        if len(priority_bugs) >= max_results:
+            return priority_bugs
+
+        # Backfill with remaining bugs (any priority, excluding already-fetched)
+        seen_keys = {b.key for b in priority_bugs}
+        remaining = max_results - len(priority_bugs)
+        all_jql = (
             f"project = OCPBUGS AND component IN ({component_list}) "
             f"AND created >= -{days}d ORDER BY created DESC"
         )
-        return self._search(jql, max_results)
+        all_bugs = self._search(all_jql, max_results)
+        backfill = [b for b in all_bugs if b.key not in seen_keys][:remaining]
+
+        return priority_bugs + backfill
 
     def _search(self, jql: str, max_results: int) -> list[Bug]:
         """Execute a JQL search with cursor-based pagination and return Bug objects.
@@ -75,11 +132,15 @@ class JiraClient:
                 components = fields.get("components", [])
                 component_name = components[0]["name"] if components else "Unknown"
 
+                description = fields.get("description", "") or ""
+                if isinstance(description, dict):
+                    description = _extract_text_from_adf(description)
+
                 bugs.append(
                     Bug(
                         key=issue["key"],
                         summary=fields.get("summary", ""),
-                        description=fields.get("description", "") or "",
+                        description=description,
                         component=component_name,
                         priority=fields.get("priority", {}).get("name", "Unknown"),
                         status=fields.get("status", {}).get("name", "Unknown"),
