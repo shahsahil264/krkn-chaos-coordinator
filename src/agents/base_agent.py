@@ -263,9 +263,36 @@ class BaseDomainAgent(ABC):
             components, summary, collection="krkn_docs", n_results=5,
         )
 
+        # Knowledge base: what krkn scenarios are POSSIBLE to build
+        kb_context = None
+        try:
+            from src.knowledge.scenario_knowledgebase import ScenarioKnowledgeBase
+            from src.generator.scenario_generator import match_scenario
+            from src.models import GapAnalysis, Confidence, ActionType
+
+            kb = ScenarioKnowledgeBase()
+            # Create a temporary gap to reuse match_scenario logic
+            temp_gap = GapAnalysis(
+                bug=bug,
+                reasoning=filter_result.injection_method or "",
+                modifications=[filter_result.failure_mode or ""],
+            )
+            matched_kb = match_scenario(temp_gap, kb)
+            if matched_kb:
+                kb_context = {
+                    "scenario_name": matched_kb.get("scenario_name"),
+                    "title": matched_kb.get("title"),
+                    "description": matched_kb.get("description", "")[:200],
+                    "parameters": [
+                        p.get("name") for p in matched_kb.get("parameters", [])
+                    ],
+                }
+        except Exception as e:
+            logger.debug("Knowledge base lookup in MAP: %s", e)
+
         if self.use_llm:
             from src.reasoning import llm_map_match
-            return llm_map_match(bug, filter_result, scenario_hits, doc_hits)
+            return llm_map_match(bug, filter_result, scenario_hits, doc_hits, kb_context=kb_context)
 
         # Fallback: threshold-based matching
         from src.reasoning import _fallback_match

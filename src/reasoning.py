@@ -53,6 +53,7 @@ def llm_map_match(
     scenario_hits: list[dict],
     doc_hits: list[dict],
     config: LLMBackendConfig | None = None,
+    kb_context: dict | None = None,
 ) -> ScenarioMatch:
     """Use LLM to determine if existing scenarios cover a bug's failure mode.
 
@@ -62,6 +63,8 @@ def llm_map_match(
         scenario_hits: ChromaDB scenario search results.
         doc_hits: ChromaDB doc search results for context.
         config: LLM backend config. Auto-detected if None.
+        kb_context: Matching krkn-knowledgebase scenario (if any) showing
+            what krkn CAN build for this failure mode.
 
     Returns:
         ScenarioMatch with LLM-reasoned match result.
@@ -86,6 +89,16 @@ def llm_map_match(
     else:
         fix_info = "Not yet fixed in any z-stream."
 
+    if kb_context:
+        kb_section = (
+            f"\nkrkn-knowledgebase: scenario '{kb_context['scenario_name']}' "
+            f"({kb_context['title']}) is available to build. "
+            f"Parameters: {', '.join(kb_context['parameters'])}. "
+            f"{kb_context['description']}"
+        )
+    else:
+        kb_section = ""
+
     prompt = f"""Bug: {bug.key}
 Component: {bug.component}
 Summary: {bug.summary}
@@ -99,6 +112,7 @@ Existing krkn scenarios (from search):
 
 Relevant OCP/krkn documentation:
 {doc_context}
+{kb_section}
 
 Does any existing scenario cover this bug's exact failure mode?"""
 

@@ -47,6 +47,14 @@ PLUGIN_TO_SCENARIO = {
     "cluster_shut_down": "power-outages",
     "zone_outages": "zone-outages",
     "kubevirt_vm_outage": "kubevirt-outage",
+    # FILTER injection_method categories (from chaos_filter.py)
+    "resource_stress": "node-cpu-hog",
+    "node": "node-scenarios",
+    "network": "network-chaos",
+    "pod": "pod-scenarios",
+    "cluster_state": "service-disruption-scenarios",
+    "time_skew": "time-scenarios",
+    "cloud_provider": "zone-outages",
 }
 
 
@@ -134,6 +142,12 @@ def match_scenario(
         match = re.search(r"krkn plugin:\s*([a-z_]+)", gap.reasoning.lower())
         if match:
             plugin_name = match.group(1)
+
+    # Check if reasoning itself is a known plugin/category name
+    if not plugin_name and gap.reasoning:
+        reasoning_lower = gap.reasoning.lower().strip()
+        if reasoning_lower in PLUGIN_TO_SCENARIO:
+            plugin_name = reasoning_lower
 
     # Check modifications for plugin names
     if not plugin_name and gap.modifications:
