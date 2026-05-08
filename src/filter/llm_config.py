@@ -7,6 +7,11 @@ Environment variables:
   LLM_PROVIDER=ollama|anthropic|openai|google|none
   LLM_MODEL=qwen2.5-coder:14b  (or claude-sonnet-4-6, gpt-4o, gemini-2.5-pro, etc.)
 
+  # Per-phase model routing (optional — falls back to LLM_PROVIDER/LLM_MODEL):
+  LLM_FILTER_PROVIDER / LLM_FILTER_MODEL   — used by FILTER phase
+  LLM_MAP_PROVIDER / LLM_MAP_MODEL         — used by MAP phase
+  LLM_ANALYZE_PROVIDER / LLM_ANALYZE_MODEL — used by ANALYZE phase
+
   # Provider-specific keys (only need the one matching LLM_PROVIDER):
   OLLAMA_BASE_URL=http://localhost:11434  (default)
   ANTHROPIC_API_KEY=sk-ant-...
@@ -20,6 +25,7 @@ import logging
 import os
 from dataclasses import dataclass
 from enum import Enum
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -40,36 +46,72 @@ class LLMBackendConfig:
     base_url: str | None = None
 
 
-def detect_llm_backend() -> LLMBackendConfig:
+_PHASE_ENV_PREFIXES: dict[str, str] = {
+    "filter": "LLM_FILTER",
+    "map": "LLM_MAP",
+    "analyze": "LLM_ANALYZE",
+}
+
+
+def _resolve_provider_and_model(
+    phase: str,
+) -> tuple[str, str | None]:
+    """Return (provider, model) for the given phase.
+
+    Checks per-phase env vars first (e.g. LLM_FILTER_PROVIDER),
+    then falls back to the global LLM_PROVIDER / LLM_MODEL.
+    The model may be None when neither per-phase nor global is set
+    (each provider branch supplies its own default in that case).
+    """
+    prefix = _PHASE_ENV_PREFIXES.get(phase)
+
+    phase_provider = ""
+    phase_model: str | None = None
+    if prefix:
+        phase_provider = os.environ.get(f"{prefix}_PROVIDER", "").lower()
+        phase_model = os.environ.get(f"{prefix}_MODEL") or None
+
+    provider = phase_provider or os.environ.get("LLM_PROVIDER", "").lower()
+    model = phase_model or os.environ.get("LLM_MODEL") or None
+    return provider, model
+
+
+def detect_llm_backend(phase: str = "default") -> LLMBackendConfig:
     """Auto-detect the best available LLM backend from environment.
 
-    Priority: explicit LLM_PROVIDER > Anthropic key > OpenAI key > Google key > Ollama > none
+    Args:
+        phase: Pipeline phase requesting an LLM.
+               "filter", "map", "analyze" check per-phase env vars first
+               (e.g. LLM_FILTER_PROVIDER / LLM_FILTER_MODEL).
+               "default" uses global config only.
+
+    Priority: explicit provider > Anthropic key > OpenAI key > Google key > Ollama > none
     """
-    explicit = os.environ.get("LLM_PROVIDER", "").lower()
+    explicit, phase_model = _resolve_provider_and_model(phase)
 
     if explicit == "anthropic" or (not explicit and os.environ.get("ANTHROPIC_API_KEY")):
-        model = os.environ.get("LLM_MODEL", "claude-sonnet-4-6")
+        model = phase_model or "claude-sonnet-4-6"
         key = os.environ.get("ANTHROPIC_API_KEY")
         if key:
-            logger.info("LLM backend: Anthropic (%s)", model)
+            logger.info("LLM backend [%s]: Anthropic (%s)", phase, model)
             return LLMBackendConfig(
                 provider=LLMProvider.ANTHROPIC, model=model, api_key=key,
             )
 
     if explicit == "openai" or (not explicit and os.environ.get("OPENAI_API_KEY")):
-        model = os.environ.get("LLM_MODEL", "gpt-4o")
+        model = phase_model or "gpt-4o"
         key = os.environ.get("OPENAI_API_KEY")
         if key and key != "not-needed":
-            logger.info("LLM backend: OpenAI (%s)", model)
+            logger.info("LLM backend [%s]: OpenAI (%s)", phase, model)
             return LLMBackendConfig(
                 provider=LLMProvider.OPENAI, model=model, api_key=key,
             )
 
     if explicit == "google" or (not explicit and os.environ.get("GOOGLE_API_KEY")):
-        model = os.environ.get("LLM_MODEL", "gemini-2.5-pro")
+        model = phase_model or "gemini-2.5-pro"
         key = os.environ.get("GOOGLE_API_KEY")
         if key:
-            logger.info("LLM backend: Google (%s)", model)
+            logger.info("LLM backend [%s]: Google (%s)", phase, model)
             return LLMBackendConfig(
                 provider=LLMProvider.GOOGLE, model=model, api_key=key,
             )
@@ -79,9 +121,9 @@ def detect_llm_backend() -> LLMBackendConfig:
         try:
             import urllib.request
             urllib.request.urlopen("http://localhost:11434/api/tags", timeout=2)
-            model = os.environ.get("LLM_MODEL", "qwen2.5-coder:14b")
+            model = phase_model or "qwen2.5-coder:14b"
             base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-            logger.info("LLM backend: Ollama (%s)", model)
+            logger.info("LLM backend [%s]: Ollama (%s)", phase, model)
             return LLMBackendConfig(
                 provider=LLMProvider.OLLAMA, model=model, base_url=base_url,
             )
@@ -89,7 +131,7 @@ def detect_llm_backend() -> LLMBackendConfig:
             pass
 
     if explicit == "none":
-        logger.info("LLM backend: none (keyword filter only)")
+        logger.info("LLM backend [%s]: none (keyword filter only)", phase)
     else:
         logger.info("No LLM backend available — using keyword filter")
 
