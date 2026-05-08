@@ -60,7 +60,7 @@ class BaseDomainAgent(ABC):
         # Semantic filter cache — gracefully degrade if unavailable
         try:
             self._filter_cache: SemanticFilterCache | None = SemanticFilterCache(
-                self.chroma._client,
+                self.chroma.client,
             )
         except Exception as e:
             logger.warning("Semantic filter cache unavailable: %s", e)

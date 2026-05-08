@@ -236,6 +236,9 @@ Is this bug chaos-relevant? Respond with JSON only."""
         raw_confidence = result.get("confidence", 1.0)
         # Normalize to 0-100 scale (handle both 0-1 and 0-100 formats)
         confidence = int(raw_confidence * 100) if raw_confidence <= 1.0 else int(raw_confidence)
+        confidence = max(0, min(100, confidence))
+
+        sonnet_result = result
 
         if confidence < 80 and "opus" not in config.model.lower():
             logger.info(
@@ -243,16 +246,23 @@ Is this bug chaos-relevant? Respond with JSON only."""
                 bug.key,
                 confidence,
             )
-            opus_config = detect_llm_backend(phase="analyze")
-            text = call_llm(messages, opus_config, system_prompt=SYSTEM_PROMPT)
+            try:
+                opus_config = detect_llm_backend(phase="analyze")
+                text = call_llm(messages, opus_config, system_prompt=SYSTEM_PROMPT)
 
-            if "```" in text:
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
-                text = text.strip()
+                if "```" in text:
+                    text = text.split("```")[1]
+                    if text.startswith("json"):
+                        text = text[4:]
+                    text = text.strip()
 
-            result = json.loads(text)
+                result = json.loads(text)
+                raw_confidence = result.get("confidence", 1.0)
+                confidence = int(raw_confidence * 100) if raw_confidence <= 1.0 else int(raw_confidence)
+                confidence = max(0, min(100, confidence))
+            except Exception as e:
+                logger.warning("Opus escalation failed for %s, using Sonnet result: %s", bug.key, e)
+                result = sonnet_result
 
         return FilterResult(
             bug=bug,
@@ -260,6 +270,7 @@ Is this bug chaos-relevant? Respond with JSON only."""
             failure_mode=result.get("failure_mode"),
             injection_method=result.get("injection_method"),
             skip_reason=result.get("skip_reason"),
+            confidence=confidence / 100.0,
         )
 
     except (json.JSONDecodeError, KeyError, Exception) as e:

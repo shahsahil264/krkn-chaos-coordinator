@@ -35,6 +35,10 @@ class ChromaStore:
             metadata={"hnsw:space": "cosine"},
         )
 
+    @property
+    def client(self):
+        return self._client
+
     def add_scenario_docs(self, chunks: list[DocChunk]) -> None:
         """Add scenario documentation chunks."""
         self._add_chunks(self._scenarios, chunks, prefix="scenario")
