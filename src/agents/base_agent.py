@@ -3,24 +3,32 @@
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC
+from dataclasses import asdict
 
 from src.apis.jira_client import JiraClient
 from src.apis.sippy_client import SippyClient
 from src.apis.github_client import GitHubClient
 from src.filter.chaos_filter import filter_bug, filter_bugs
-from src.filter.llm_filter import llm_filter_bugs
+from src.filter.llm_tools import filter_bug_llm, map_match_llm, analyze_gap_llm
 from src.knowledge.chromadb_store import ChromaStore
 from src.knowledge.component_map import get_components_for_agent
 from src.knowledge.filter_cache import SemanticFilterCache
 from src.knowledge.neo4j_store import Neo4jStore
 from src.knowledge.scenario_index import ScenarioInfo
+from src.logging_util import StructuredLogger
 from src.models import (
     AgentResult,
+    AnalyzeContext,
     Bug,
+    FilterContext,
     FilterResult,
     GapAnalysis,
+    MapContext,
     MatchResult,
+    Observation,
+    RunMetrics,
     ScenarioMatch,
 )
 
@@ -56,8 +64,8 @@ class BaseDomainAgent(ABC):
         self.max_bugs = max_bugs
         self.days = days
         self.components = get_components_for_agent(agent_name)
+        self._slog = StructuredLogger(f"coordinator.{agent_name}")
 
-        # Semantic filter cache — gracefully degrade if unavailable
         try:
             self._filter_cache: SemanticFilterCache | None = SemanticFilterCache(
                 self.chroma.client,
@@ -68,14 +76,13 @@ class BaseDomainAgent(ABC):
 
     def run(self) -> AgentResult:
         """Execute the full pipeline: DISCOVER → FILTER → MAP → ANALYZE → ACT → REMEMBER."""
-        import asyncio
         logger.info("=== %s agent starting ===", self.agent_name)
+        self._slog.clear()
+        metrics = RunMetrics()
 
         # DISCOVER
         bugs = self._discover()
         logger.info("DISCOVER: found %d bugs", len(bugs))
-
-        # Enrich with z-stream changelog data
         bugs = self._enrich_with_changelog(bugs)
 
         # Split into new vs known bugs
@@ -84,23 +91,33 @@ class BaseDomainAgent(ABC):
         known_bugs = [b for b in bugs if b.key in known_keys]
 
         if known_bugs:
-            logger.info("DISCOVER: %d known bugs — updating status in Neo4j", len(known_bugs))
+            logger.info("DISCOVER: %d known bugs — updating status", len(known_bugs))
             self._update_known_bugs(known_bugs)
 
         if new_bugs:
             logger.info("DISCOVER: %d new bugs to analyze", len(new_bugs))
 
+        metrics.bugs_processed = len(new_bugs)
+
         # FILTER
-        relevant, skipped = self._filter(new_bugs)
+        filter_start = time.monotonic()
+        relevant, skipped = self._filter(new_bugs, metrics)
+        metrics.filter_duration_sec = round(time.monotonic() - filter_start, 2)
         logger.info("FILTER: %d relevant, %d skipped", len(relevant), len(skipped))
 
         # MAP
-        matched, unmatched = self._map(relevant)
+        map_start = time.monotonic()
+        matched, unmatched = self._map(relevant, metrics)
+        metrics.map_duration_sec = round(time.monotonic() - map_start, 2)
         logger.info("MAP: %d matched, %d unmatched", len(matched), len(unmatched))
 
         # ANALYZE
-        gaps = self._analyze(unmatched)
+        analyze_start = time.monotonic()
+        gaps = self._analyze(unmatched, metrics)
+        metrics.analyze_duration_sec = round(time.monotonic() - analyze_start, 2)
         logger.info("ANALYZE: %d gaps identified", len(gaps))
+
+        metrics.bugs_succeeded = len(relevant) + len(skipped)
 
         result = AgentResult(
             agent_name=self.agent_name,
@@ -112,12 +129,20 @@ class BaseDomainAgent(ABC):
 
         # REMEMBER
         self._remember(result)
+        self._store_metrics(metrics)
 
         logger.info("=== %s agent complete ===", self.agent_name)
         return result
 
+    # ── DISCOVER ──────────────────────────────────────────────────
+
+    def _discover(self) -> list[Bug]:
+        return self.jira.get_bugs_by_components(
+            self.components, days=self.days, max_results=self.max_bugs,
+            release=self.release,
+        )
+
     def _enrich_with_changelog(self, bugs: list[Bug]) -> list[Bug]:
-        """Enrich bugs with z-stream fix info from release changelogs."""
         try:
             from src.apis.release_client import get_all_fixed_bugs
             fixed_map = get_all_fixed_bugs(self.release)
@@ -134,18 +159,11 @@ class BaseDomainAgent(ABC):
             bug_fix = fixed_map.get(bug.key)
             if bug_fix:
                 bug = Bug(
-                    key=bug.key,
-                    summary=bug.summary,
-                    description=bug.description,
-                    component=bug.component,
-                    priority=bug.priority,
-                    status=bug.status,
-                    created=bug.created,
-                    url=bug.url,
-                    all_components=bug.all_components,
+                    key=bug.key, summary=bug.summary, description=bug.description,
+                    component=bug.component, priority=bug.priority, status=bug.status,
+                    created=bug.created, url=bug.url, all_components=bug.all_components,
                     fixed_in_release=bug_fix.fixed_in,
-                    fix_commits=bug_fix.commits,
-                    fix_image=bug_fix.image,
+                    fix_commits=bug_fix.commits, fix_image=bug_fix.image,
                 )
                 fixed_count += 1
             enriched.append(bug)
@@ -155,51 +173,45 @@ class BaseDomainAgent(ABC):
         return enriched
 
     def _update_known_bugs(self, known_bugs: list[Bug]) -> None:
-        """Update status/priority for already-analyzed bugs. Closes gaps for resolved bugs."""
         self.neo4j.update_bug_statuses(known_bugs)
 
     def _get_known_bugs(self) -> set[str]:
-        """Get already-analyzed bug keys from Neo4j."""
         return self.neo4j.get_analyzed_bug_keys_sync()
 
-    def _remember(self, result: AgentResult) -> None:
-        """Store results in Neo4j."""
-        self.neo4j.remember_result_sync(result)
-        logger.info("REMEMBER: stored in Neo4j")
+    # ── FILTER ────────────────────────────────────────────────────
 
-    def _discover(self) -> list[Bug]:
-        """DISCOVER: Query JIRA and Sippy for bugs and regressions."""
-        return self.jira.get_bugs_by_components(
-            self.components, days=self.days, max_results=self.max_bugs,
-            release=self.release,
-        )
-
-    def _filter(self, bugs: list[Bug]) -> tuple[list[FilterResult], list[FilterResult]]:
-        """FILTER: Determine chaos relevance of each bug."""
+    def _filter(
+        self, bugs: list[Bug], metrics: RunMetrics,
+    ) -> tuple[list[FilterResult], list[FilterResult]]:
         if self.use_llm:
-            logger.info("Using tiered filter: keyword → semantic cache → LLM")
-            return self._tiered_filter(bugs)
+            logger.info("Using tiered filter: keyword → cache → LLM")
+            return self._tiered_filter(bugs, metrics)
         return filter_bugs(bugs)
 
     def _tiered_filter(
-        self, bugs: list[Bug],
+        self, bugs: list[Bug], metrics: RunMetrics,
     ) -> tuple[list[FilterResult], list[FilterResult]]:
         """Three-tier filter: keyword → semantic cache → LLM."""
         relevant: list[FilterResult] = []
         skipped: list[FilterResult] = []
         needs_llm: list[Bug] = []
 
-        # Layer 1: Keyword pre-filter with confidence scoring
+        # Layer 1: Keyword pre-filter
         for bug in bugs:
             kw_result = filter_bug(bug)
             if kw_result.confidence > 0.8:
-                # High confidence — trust keyword filter
                 if kw_result.chaos_relevant:
                     relevant.append(kw_result)
                 else:
                     skipped.append(kw_result)
+                metrics.keyword_filter_hits += 1
+                self._slog.log_phase("filter", "success", f"{bug.key}: keyword ({kw_result.confidence:.0%})",
+                                     bug_key=bug.key, cache_hit=True)
             elif kw_result.confidence < 0.2:
                 skipped.append(kw_result)
+                metrics.keyword_filter_hits += 1
+                self._slog.log_phase("filter", "success", f"{bug.key}: keyword skip",
+                                     bug_key=bug.key, cache_hit=True)
             else:
                 needs_llm.append(bug)
 
@@ -209,52 +221,22 @@ class BaseDomainAgent(ABC):
             cached = self._filter_cache.get(bug.summary) if self._filter_cache else None
             if cached is not None:
                 result = FilterResult(
-                    bug=bug,
-                    chaos_relevant=cached.chaos_relevant,
+                    bug=bug, chaos_relevant=cached.chaos_relevant,
                     failure_mode=cached.failure_mode,
-                    injection_method=cached.injection_method,
-                    confidence=0.9,
+                    injection_method=cached.injection_method, confidence=0.9,
                 )
                 if result.chaos_relevant:
                     relevant.append(result)
                 else:
                     skipped.append(result)
+                metrics.semantic_cache_hits += 1
+                self._slog.log_phase("filter", "success", f"{bug.key}: cache hit",
+                                     bug_key=bug.key, cache_hit=True)
             else:
                 still_needs_llm.append(bug)
 
-        # Layer 3: LLM
-        if still_needs_llm:
-            llm_relevant, llm_skipped = self._llm_filter_with_docs(still_needs_llm)
-            relevant.extend(llm_relevant)
-            skipped.extend(llm_skipped)
-            # Cache LLM results for future runs
-            if self._filter_cache:
-                for r in [*llm_relevant, *llm_skipped]:
-                    self._filter_cache.put(r.bug.summary, r)
-
-        logger.info(
-            "FILTER tiers: %d keyword, %d cached, %d LLM",
-            len(bugs) - len(needs_llm),
-            len(needs_llm) - len(still_needs_llm),
-            len(still_needs_llm),
-        )
-        return relevant, skipped
-
-    def _llm_filter_with_docs(
-        self, bugs: list[Bug],
-    ) -> tuple[list[FilterResult], list[FilterResult]]:
-        """LLM filter enriched with per-component OCP docs from ChromaDB."""
-        from src.filter.llm_filter import llm_filter_bug
-        from src.filter.llm_config import detect_llm_backend
-
-        config = detect_llm_backend()
-        relevant = []
-        skipped = []
-
-        for i, bug in enumerate(bugs):
-            logger.info("LLM filtering %d/%d: %s", i + 1, len(bugs), bug.key)
-
-            # Search ChromaDB for component architecture docs + krkn capabilities
+        # Layer 3: LLM via typed tool
+        for bug in still_needs_llm:
             components = bug.all_components or (bug.component,)
             ocp_docs = self.chroma.search_per_component(
                 components, bug.summary, collection="all", n_results=3,
@@ -262,27 +244,42 @@ class BaseDomainAgent(ABC):
             krkn_docs = self.chroma.search_per_component(
                 components, bug.summary, collection="krkn_docs", n_results=3,
             )
+            ctx = FilterContext(ocp_docs=tuple(ocp_docs), krkn_docs=tuple(krkn_docs))
 
-            result = llm_filter_bug(bug, config=config, ocp_docs=ocp_docs, krkn_docs=krkn_docs)
+            result, obs = filter_bug_llm(bug, ctx)
+            metrics.llm_filter_calls += 1
+            if obs.status == "error":
+                metrics.filter_retries += 1
+
+            self._slog.log_phase("filter", obs.status, obs.summary, bug_key=bug.key)
 
             if result.chaos_relevant:
                 relevant.append(result)
-                logger.info("  PASS: %s (%s)", result.failure_mode, result.injection_method)
             else:
                 skipped.append(result)
-                logger.info("  SKIP: %s", result.skip_reason)
 
-        logger.info("LLM filter: %d relevant, %d skipped", len(relevant), len(skipped))
+            if self._filter_cache:
+                self._filter_cache.put(bug.summary, result)
+
+        logger.info("FILTER tiers: %d keyword, %d cached, %d LLM",
+                     len(bugs) - len(needs_llm),
+                     len(needs_llm) - len(still_needs_llm),
+                     len(still_needs_llm))
         return relevant, skipped
 
-    def _map(self, relevant: list[FilterResult]) -> tuple[list[ScenarioMatch], list[ScenarioMatch]]:
-        """MAP: Match bugs against existing krkn scenarios using ChromaDB + local index."""
+    # ── MAP ───────────────────────────────────────────────────────
+
+    def _map(
+        self, relevant: list[FilterResult], metrics: RunMetrics,
+    ) -> tuple[list[ScenarioMatch], list[ScenarioMatch]]:
         matched = []
         unmatched = []
 
         for filter_result in relevant:
             bug = filter_result.bug
-            match = self._find_scenario_match(bug, filter_result)
+            match, obs = self._find_scenario_match(bug, filter_result, metrics)
+            self._slog.log_phase("map", obs.status, obs.summary, bug_key=bug.key)
+
             if match.match_result == MatchResult.FULL_MATCH:
                 matched.append(match)
             else:
@@ -290,13 +287,9 @@ class BaseDomainAgent(ABC):
 
         return matched, unmatched
 
-    def _find_scenario_match(self, bug: Bug, filter_result: FilterResult) -> ScenarioMatch:
-        """Search for existing krkn scenarios that match a bug.
-
-        Uses ChromaDB for retrieval — searches per component separately for
-        multi-component bugs so results aren't diluted. If use_llm is True,
-        LLM reasons over the retrieved results.
-        """
+    def _find_scenario_match(
+        self, bug: Bug, filter_result: FilterResult, metrics: RunMetrics,
+    ) -> tuple[ScenarioMatch, 'Observation']:
         summary_parts = [bug.summary]
         if filter_result.failure_mode:
             summary_parts.append(filter_result.failure_mode)
@@ -305,8 +298,6 @@ class BaseDomainAgent(ABC):
         summary = " ".join(summary_parts)
 
         components = bug.all_components or (bug.component,)
-
-        # ChromaDB retrieval — per component, merged
         scenario_hits = self.chroma.search_per_component(
             components, summary, collection="scenarios", n_results=5,
         )
@@ -314,54 +305,63 @@ class BaseDomainAgent(ABC):
             components, summary, collection="krkn_docs", n_results=5,
         )
 
-        # Knowledge base: what krkn scenarios are POSSIBLE to build
-        kb_context = None
+        kb_context = self._lookup_knowledgebase(bug, filter_result)
+
+        if self.use_llm:
+            ctx = MapContext(
+                scenario_hits=tuple(scenario_hits),
+                doc_hits=tuple(doc_hits),
+                kb_context=kb_context,
+            )
+            match, obs = map_match_llm(bug, filter_result, ctx)
+            metrics.llm_map_calls += 1
+            if obs.status == "error":
+                metrics.map_fallbacks += 1
+            return match, obs
+
+        from src.reasoning import _fallback_match
+        from src.models import Observation
+        match = _fallback_match(bug, scenario_hits)
+        obs = Observation(
+            status="success",
+            summary=f"{bug.key}: distance-based match={match.match_result.value}",
+            next_actions=("proceed_to_analyze",) if match.match_result != MatchResult.FULL_MATCH else ("skip_full_match",),
+        )
+        return match, obs
+
+    def _lookup_knowledgebase(self, bug: Bug, filter_result: FilterResult) -> dict | None:
         try:
             from src.knowledge.scenario_knowledgebase import ScenarioKnowledgeBase
             from src.generator.scenario_generator import match_scenario
-            from src.models import GapAnalysis, Confidence, ActionType
 
             kb = ScenarioKnowledgeBase()
-            # Create a temporary gap to reuse match_scenario logic
             temp_gap = GapAnalysis(
-                bug=bug,
-                reasoning=filter_result.injection_method or "",
+                bug=bug, reasoning=filter_result.injection_method or "",
                 modifications=[filter_result.failure_mode or ""],
             )
             matched_kb = match_scenario(temp_gap, kb)
             if matched_kb:
-                kb_context = {
+                return {
                     "scenario_name": matched_kb.get("scenario_name"),
                     "title": matched_kb.get("title"),
                     "description": matched_kb.get("description", "")[:200],
-                    "parameters": [
-                        p.get("name") for p in matched_kb.get("parameters", [])
-                    ],
+                    "parameters": [p.get("name") for p in matched_kb.get("parameters", [])],
                 }
         except Exception as e:
             logger.debug("Knowledge base lookup in MAP: %s", e)
+        return None
 
-        if self.use_llm:
-            from src.reasoning import llm_map_match
-            return llm_map_match(bug, filter_result, scenario_hits, doc_hits, kb_context=kb_context)
+    # ── ANALYZE ───────────────────────────────────────────────────
 
-        # Fallback: threshold-based matching
-        from src.reasoning import _fallback_match
-        return _fallback_match(bug, scenario_hits)
-
-    def _analyze(self, unmatched: list[ScenarioMatch]) -> list[GapAnalysis]:
-        """ANALYZE: Score confidence and determine action for each gap.
-
-        If use_llm is True, LLM reasons over ChromaDB context + Neo4j history
-        to produce specific recommendations. Otherwise, uses keyword scoring.
-        """
+    def _analyze(
+        self, unmatched: list[ScenarioMatch], metrics: RunMetrics,
+    ) -> list[GapAnalysis]:
         gaps = []
 
         for match in unmatched:
             bug = match.bug
 
             if self.use_llm:
-                # Gather context for LLM — search per component
                 components = bug.all_components or (bug.component,)
                 ocp_docs = self.chroma.search_per_component(
                     components, bug.summary, collection="all", n_results=5,
@@ -369,28 +369,52 @@ class BaseDomainAgent(ABC):
                 krkn_docs = self.chroma.search_per_component(
                     components, bug.summary, collection="krkn_docs", n_results=3,
                 )
-
                 neo4j_history = []
                 try:
                     for comp in components:
-                        neo4j_history.extend(
-                            self.neo4j.get_similar_resolved_bugs(comp)
-                        )
+                        neo4j_history.extend(self.neo4j.get_similar_resolved_bugs(comp))
                 except Exception as e:
                     logger.warning("Neo4j history lookup failed: %s", e)
 
-                from src.reasoning import llm_analyze_gap
-                gap = llm_analyze_gap(
-                    bug=bug,
-                    match=match,
-                    ocp_docs=ocp_docs,
-                    krkn_docs=krkn_docs,
-                    neo4j_history=neo4j_history,
+                ctx = AnalyzeContext(
+                    ocp_docs=tuple(ocp_docs),
+                    krkn_docs=tuple(krkn_docs),
+                    neo4j_history=tuple(neo4j_history),
                 )
+                gap, obs = analyze_gap_llm(bug, match, ctx)
+                metrics.llm_analyze_calls += 1
+                if obs.status == "error":
+                    metrics.analyze_retries += 1
             else:
                 from src.reasoning import _fallback_analyze
                 gap = _fallback_analyze(bug, match)
+                obs = Observation(
+                    status="success",
+                    summary=f"{bug.key}: keyword-based analysis, confidence={gap.confidence_score}",
+                )
 
+            self._slog.log_phase("analyze", obs.status, obs.summary,
+                                 bug_key=bug.key, confidence=gap.confidence_score)
             gaps.append(gap)
 
         return gaps
+
+    # ── REMEMBER ──────────────────────────────────────────────────
+
+    def _remember(self, result: AgentResult) -> None:
+        self.neo4j.remember_result_sync(result)
+        logger.info("REMEMBER: stored in Neo4j")
+
+    def _store_metrics(self, metrics: RunMetrics) -> None:
+        metrics_dict = {**asdict(metrics), "agent": self.agent_name}
+        try:
+            self.neo4j.store_run_metrics(metrics_dict)
+            logger.info(
+                "METRICS: filter=%d kw/%d cache/%d llm, map=%d, analyze=%d, tokens=%d",
+                metrics.keyword_filter_hits, metrics.semantic_cache_hits,
+                metrics.llm_filter_calls, metrics.llm_map_calls,
+                metrics.llm_analyze_calls,
+                self._slog.total_tokens(),
+            )
+        except Exception as e:
+            logger.warning("Failed to store RunMetrics: %s", e)
