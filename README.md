@@ -16,6 +16,8 @@
 
 </div>
 
+Project overview: [open the static site](https://krkn-chaos.github.io/krkn-chaos-coordinator/)
+
 ---
 
 ## Pipeline
@@ -82,7 +84,13 @@ python src/main.py --release 4.21 --use-llm                         # all agents
 python src/main.py --release 4.21 --agent control_plane --use-llm   # single
 python src/main.py --release 4.20,4.21 --agent networking,storage   # multi
 python src/main.py --release 4.21                                    # keyword only (no LLM)
+python src/main.py --interactive                                     # prompt for scan options
 ```
+
+The interactive wizard is implemented in the CLI for normal shells and
+stdin-capable harnesses. Claude Code and OpenCode commands expose the same
+choices through their native question interfaces; automation can continue to
+pass explicit flags.
 
 #### Status output
 ```

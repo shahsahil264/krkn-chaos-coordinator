@@ -15,6 +15,7 @@ from src.apis.github_client import GitHubClient
 from src.coordinator.orchestrator import deduplicate_gaps, format_approval_queue, format_summary
 from src.knowledge.chromadb_store import ChromaStore
 from src.knowledge.scenario_index import index_scenarios_from_repo
+from src.models import AgentResult
 
 LOG_FILE = "krkn-chaos-coordinator.log"
 
@@ -87,7 +88,16 @@ def main():
         default=False,
         help="Skip interactive filter review prompt after virtualization scans",
     )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        default=False,
+        help="Prompt for release, agents, lookback, scan mode, and filter stages",
+    )
     args = parser.parse_args()
+
+    if args.interactive:
+        _apply_interactive_options(args, registered)
 
     if args.domain_filter_only and args.use_llm:
         print("ERROR: --domain-filter-only cannot be combined with --use-llm")
@@ -335,6 +345,105 @@ def _prompt_github_issues(gaps: list, github: GitHubClient) -> None:
                 print(f"  ✗ {gap.bug.key}: failed to create issue")
     except KeyboardInterrupt:
         print("\n  Issue creation interrupted.")
+
+
+def _prompt_choice(prompt: str, options: list[str], default: int = 1) -> int:
+    """Read a numbered choice, accepting a default and retrying invalid input."""
+    while True:
+        print(f"\n{prompt}")
+        for index, option in enumerate(options, 1):
+            suffix = " (default)" if index == default else ""
+            print(f"  {index}. {option}{suffix}")
+        answer = input(f"  Select [1-{len(options)}] (Enter for {default}): ").strip()
+        if not answer:
+            return default
+        try:
+            choice = int(answer)
+        except ValueError:
+            choice = 0
+        if 1 <= choice <= len(options):
+            return choice
+        print("  Invalid selection. Enter one of the numbered options.")
+
+
+def _prompt_agents(registered: dict) -> str | None:
+    """Prompt for all agents or a validated comma-separated agent list."""
+    print("\nAvailable agents:")
+    for name in sorted(registered):
+        config = registered[name]
+        print(f"  - {name}: {config.description or name}")
+
+    choice = _prompt_choice(
+        "Which domain agent(s) should run?",
+        ["All agents (Recommended)", "Enter agent ID(s)"],
+    )
+    if choice == 1:
+        return None
+
+    valid_names = set(registered)
+    while True:
+        answer = input("  Agent ID(s), comma-separated: ").strip()
+        names = [name.strip() for name in answer.split(",") if name.strip()]
+        unknown = [name for name in names if name not in valid_names]
+        if names and not unknown:
+            return ",".join(names)
+        detail = f" Unknown: {', '.join(unknown)}." if unknown else ""
+        print(f"  Enter at least one valid agent ID.{detail}")
+
+
+def _prompt_positive_int(prompt: str, default: int) -> int:
+    """Read a positive integer from stdin."""
+    while True:
+        answer = input(f"{prompt} (Enter for {default}): ").strip()
+        if not answer:
+            return default
+        try:
+            value = int(answer)
+        except ValueError:
+            value = 0
+        if value > 0:
+            return value
+        print("  Enter a positive whole number.")
+
+
+def _apply_interactive_options(args, registered: dict) -> None:
+    """Populate argparse options through a harness-neutral stdin wizard."""
+    print("\nkrkn-chaos-coordinator interactive scan")
+    print("You can use this wizard in a terminal or feed answers from another harness.\n")
+
+    release = input(
+        f"OpenShift release(s), comma-separated (Enter for {args.release}): "
+    ).strip()
+    if release:
+        args.release = release
+
+    args.agent = _prompt_agents(registered)
+    args.days = _prompt_positive_int("Look back how many days", args.days)
+
+    scan_choice = _prompt_choice(
+        "What kind of scan?",
+        [
+            "Full scan (LLM enabled)",
+            "Quick scan (50 bugs, LLM enabled)",
+            "Keyword only (free, no LLM)",
+        ],
+    )
+    args.max_bugs = 50 if scan_choice == 2 else 2000
+    args.use_llm = scan_choice in (1, 2)
+
+    filter_choice = _prompt_choice(
+        "Which filter stages should be applied?",
+        [
+            "OpenShift Virtualization and Krkn Chaos",
+            "OpenShift Virtualization only",
+            "Krkn Chaos only",
+        ],
+    )
+    args.domain_filter_only = filter_choice == 2
+    if args.domain_filter_only:
+        args.use_llm = False
+        args.filter_review_json = args.filter_review_json or "filter_review.json"
+        args.no_filter_review = True
 
 
 if __name__ == "__main__":
