@@ -13,6 +13,10 @@ from pathlib import Path
 
 import streamlit as st
 import pandas as pd
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -686,7 +690,7 @@ if run_button or st.session_state.get("has_run"):
 
                     if col_a.button("APPROVE", key=f"approve_{i}", type="primary"):
                         # Get GitHub token
-                        token = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+                        token = os.environ.get("GITHUB_TOKEN", "")
                         if not token:
                             # Try reading from cursor config
                             cursor_cfg = Path.home() / ".cursor" / "mcp.json"
@@ -694,10 +698,10 @@ if run_button or st.session_state.get("has_run"):
                                 with open(cursor_cfg) as f:
                                     cfg = json.load(f)
                                 gh_env = cfg.get("mcpServers", {}).get("github", {}).get("env", {})
-                                token = gh_env.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+                                token = gh_env.get("GITHUB_TOKEN", "")
 
                         if not token:
-                            st.error("GitHub token not found. Set GITHUB_PERSONAL_ACCESS_TOKEN env var or configure in ~/.cursor/mcp.json")
+                            st.error("GitHub token not found. Set GITHUB_TOKEN env var or configure in ~/.cursor/mcp.json")
                         else:
                             github = GitHubClient(token=token)
                             title = build_issue_title(gap)
