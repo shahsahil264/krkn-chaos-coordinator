@@ -776,22 +776,26 @@ if __name__ == "__main__":
     import os
     import sys
     from pathlib import Path
+    from dotenv import load_dotenv
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 
+    # Load environment variables from .env file
+    load_dotenv()
+
     # Load GitHub token
-    token = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+    token = os.environ.get("GITHUB_TOKEN", "")
     if not token:
         cursor_cfg = Path.home() / ".cursor" / "mcp.json"
         if cursor_cfg.exists():
             with open(cursor_cfg) as f:
                 cfg = json.load(f)
             token = cfg.get("mcpServers", {}).get("github", {}).get("env", {}).get(
-                "GITHUB_PERSONAL_ACCESS_TOKEN", ""
+                "GITHUB_TOKEN", ""
             )
 
     if not token:
-        print("ERROR: Set GITHUB_PERSONAL_ACCESS_TOKEN or configure in ~/.cursor/mcp.json")
+        print("ERROR: Set GITHUB_TOKEN or configure in ~/.cursor/mcp.json")
         sys.exit(1)
 
     chroma_dir = sys.argv[1] if len(sys.argv) > 1 else "./chroma_data"
